@@ -112,5 +112,54 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
         )
     )
 
+    # ==== Expectation mới của nhóm (≥2 so với baseline E1–E6) ====
+
+    # E7 [NEW] (halt): access_control_sop phải có mặt sau clean.
+    # Guard cho [FIX] allowlist — nếu lỡ bỏ access_control_sop, gq_d10_10 fail âm thầm;
+    # expectation này bắt lỗi NGAY ở tầng validate.
+    acl_rows = [r for r in cleaned_rows if r.get("doc_id") == "access_control_sop"]
+    ok7 = len(acl_rows) >= 1
+    results.append(
+        ExpectationResult(
+            "access_control_sop_present",
+            ok7,
+            "halt",
+            f"access_control_rows={len(acl_rows)}",
+        )
+    )
+
+    # E8 [NEW] (halt): không rò email nội bộ vào vector store (PII masking phải chạy).
+    pii_leak = [
+        r
+        for r in cleaned_rows
+        if re.search(r"@company\.internal", (r.get("chunk_text") or ""), re.IGNORECASE)
+    ]
+    ok8 = len(pii_leak) == 0
+    results.append(
+        ExpectationResult(
+            "no_internal_email_pii",
+            ok8,
+            "halt",
+            f"pii_email_rows={len(pii_leak)}",
+        )
+    )
+
+    # E9 [NEW] (warn): không còn marker nhiễu rõ ràng sau clean (chỉ cảnh báo, không chặn).
+    noise = [
+        r
+        for r in cleaned_rows
+        if ("nội dung không rõ ràng" in (r.get("chunk_text") or "").lower())
+        or (r.get("chunk_text") or "").lstrip().startswith("!!!")
+    ]
+    ok9 = len(noise) == 0
+    results.append(
+        ExpectationResult(
+            "no_noise_marker",
+            ok9,
+            "warn",
+            f"noise_rows={len(noise)}",
+        )
+    )
+
     halt = any(not r.passed and r.severity == "halt" for r in results)
     return results, halt

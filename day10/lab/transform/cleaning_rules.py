@@ -3,6 +3,17 @@ Cleaning rules — raw export → cleaned rows + quarantine.
 
 Baseline gồm các failure mode mở rộng (allowlist doc_id, parse ngày, HR stale version).
 Sinh viên thêm ≥3 rule mới: mỗi rule phải ghi `metric_impact` (xem README — chống trivial).
+
+==== Mở rộng của nhóm (đánh dấu [FIX]/[NEW Rn]) ====
+  [FIX]    ALLOWED_DOC_IDS += "access_control_sop" → nguồn hợp lệ bị baseline quarantine nhầm
+           (gq_d10_10 cần top1 = access_control_sop).
+  [NEW R1] stale_hr_version: quarantine HR chunk còn marker "10 ngày phép năm" /
+           "(bản HR 2025)" *bất kể ngày* — vá lỗ hổng baseline chỉ lọc theo effective_date
+           (chunk HR 2025 gắn ngày 2026 vẫn lọt) → trước fix expectation E6 halt.
+  [NEW R2] strip_noise_markers: bỏ tiền tố rác "Nội dung không rõ ràng:", "!!!", và gộp
+           "làm việc làm việc" → "làm việc"; chunk rỗng sau strip rơi về missing_chunk_text.
+  [NEW R3] mask_pii_email: che email nội bộ (@company.internal) → "[email-redacted]".
+Bảng metric_impact: xem reports/group_report.md.
 """
 
 from __future__ import annotations
@@ -14,17 +25,48 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 # Khớp export hợp lệ trong lab (mở rộng khi nhóm thêm doc mới — phải đồng bộ contract).
+# [FIX] access_control_sop bị thiếu trong baseline → bổ sung để gq_d10_10 retrieve đúng nguồn.
 ALLOWED_DOC_IDS = frozenset(
     {
         "policy_refund_v4",
         "sla_p1_2026",
         "it_helpdesk_faq",
         "hr_leave_policy",
+        "access_control_sop",
     }
 )
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DMY_SLASH = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+
+# [NEW R1] Marker bản HR 2025 cũ (xung đột version: 10 vs 12 ngày phép năm).
+_STALE_HR_MARKERS = ("10 ngày phép năm", "bản hr 2025")
+
+# [NEW R2] Tiền tố / nhiễu cần loại trước khi embed.
+_NOISE_PREFIXES = ("nội dung không rõ ràng:", "!!!")
+_DOUBLED_PHRASE = re.compile(r"làm việc làm việc", re.IGNORECASE)
+
+# [NEW R3] Email nội bộ coi là PII vận hành — không nên đẩy vào vector store.
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@company\.internal", re.IGNORECASE)
+
+
+def _strip_noise_markers(text: str) -> str:
+    """[NEW R2] Bỏ tiền tố rác đầu chunk + gộp cụm lặp 'làm việc làm việc'."""
+    out = (text or "").strip()
+    changed = True
+    while changed:
+        changed = False
+        for pref in _NOISE_PREFIXES:
+            if out.lower().startswith(pref):
+                out = out[len(pref):].strip()
+                changed = True
+    out = _DOUBLED_PHRASE.sub("làm việc", out)
+    return out.strip()
+
+
+def _mask_pii_email(text: str) -> str:
+    """[NEW R3] Che email nội bộ trước khi embed."""
+    return _EMAIL_RE.sub("[email-redacted]", text)
 
 
 def _norm_text(s: str) -> str:
@@ -77,6 +119,11 @@ def clean_rows(
     4) Quarantine: chunk_text rỗng hoặc effective_date rỗng sau chuẩn hoá.
     5) Loại trùng nội dung chunk_text (giữ bản đầu).
     6) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
+
+    Rule mới của nhóm (xem docstring đầu file):
+    R1) Quarantine HR chunk còn marker "10 ngày phép năm"/"(bản HR 2025)" bất kể ngày.
+    R2) strip_noise_markers trước khi check rỗng + dedupe.
+    R3) mask_pii_email trên chunk_text giữ lại.
     """
     quarantine: List[Dict[str, Any]] = []
     seen_text: set[str] = set()
@@ -111,6 +158,15 @@ def clean_rows(
             )
             continue
 
+        # [NEW R1] Bản HR 2025 cũ có thể gắn ngày 2026 (baseline lọt) — chặn theo NỘI DUNG.
+        low = text.lower()
+        if doc_id == "hr_leave_policy" and any(m in low for m in _STALE_HR_MARKERS):
+            quarantine.append({**raw, "reason": "stale_hr_version_marker"})
+            continue
+
+        # [NEW R2] Loại nhiễu trước khi quyết định rỗng/dedupe.
+        text = _strip_noise_markers(text)
+
         if not text:
             quarantine.append({**raw, "reason": "missing_chunk_text"})
             continue
@@ -129,6 +185,9 @@ def clean_rows(
                     "7 ngày làm việc",
                 )
                 fixed_text += " [cleaned: stale_refund_window]"
+
+        # [NEW R3] Che PII email nội bộ trên text giữ lại.
+        fixed_text = _mask_pii_email(fixed_text)
 
         seq += 1
         cleaned.append(
